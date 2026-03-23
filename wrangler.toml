@@ -1,0 +1,15 @@
+# wrangler.toml — Cloudflare Pages configuration
+# Used for local dev with `npx wrangler pages dev`
+# Environment variables are set in the Cloudflare dashboard for production
+
+name = "sc-case-alerts"
+compatibility_date = "2024-12-01"
+
+# Pages-specific settings
+[vars]
+COURTS_CSV = "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,21,22"
+CACHE_TTL_SECONDS = "8"
+
+# For local dev, you can set secrets here (DO NOT commit real values)
+# AUTH_USER = "change-me"
+# AUTH_PASS = "change-me"

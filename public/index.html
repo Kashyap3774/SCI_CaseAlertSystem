@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>SC Case Alert System</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#0c1222" />
+  <meta name="description" content="Real-time Supreme Court of India case hearing alerts with browser notifications." />
+  <link rel="manifest" href="/manifest.webmanifest" />
+
+  <!-- Fonts: preconnect + load -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:opsz,wght@8..60,400;8..60,600;8..60,700&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="/style.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%230c1222'/><text x='16' y='21.5' font-size='14' font-weight='bold' fill='%23c9a84c' text-anchor='middle' font-family='serif'>SC</text></svg>" />
+</head>
+<body>
+  <main class="container">
+
+    <!-- ── Top bar ── -->
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-mark">SC</div>
+        <div class="brand-text">
+          <h1>Case Alert System</h1>
+          <span class="brand-sub">Supreme Court of India &middot; Live Noticeboard</span>
+        </div>
+      </div>
+      <div class="status-badge" id="status-badge">
+        <span class="pulse-dot" id="pulse"></span>
+        <span id="status-text">Connecting…</span>
+      </div>
+    </header>
+
+    <!-- ── Notification permission banner ── -->
+    <div class="notif-banner" id="notif-banner">
+      <svg class="banner-icon" viewBox="0 0 20 20" fill="currentColor" width="18" height="18"><path d="M10 2a6 6 0 00-6 6v3.586l-.707.707A1 1 0 004 14h12a1 1 0 00.707-1.707L16 11.586V8a6 6 0 00-6-6zm0 16a2 2 0 01-2-2h4a2 2 0 01-2 2z"/></svg>
+      <span class="banner-text">Enable notifications to get alerted when your case is approaching.</span>
+      <button id="enable-notif">Enable Alerts</button>
+      <button class="dismiss" id="dismiss-banner" aria-label="Dismiss">&times;</button>
+    </div>
+
+    <!-- ── Ticker ── -->
+    <div class="ticker">
+      <div class="ticker-label">LIVE</div>
+      <div class="ticker-track">
+        <div class="inner" id="ticker">Loading sequence…</div>
+      </div>
+    </div>
+
+    <!-- ── Configuration card ── -->
+    <section class="card config-card">
+      <div class="card-header">
+        <h2>
+          <svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18"><path fill-rule="evenodd" d="M11.49 3.17c-.38-1.56-2.6-1.56-2.98 0a1.532 1.532 0 01-2.286.948c-1.372-.836-2.942.734-2.106 2.106.54.886.061 2.042-.947 2.287-1.561.379-1.561 2.6 0 2.978a1.532 1.532 0 01.947 2.287c-.836 1.372.734 2.942 2.106 2.106a1.532 1.532 0 012.287.947c.379 1.561 2.6 1.561 2.978 0a1.533 1.533 0 012.287-.947c1.372.836 2.942-.734 2.106-2.106a1.533 1.533 0 01.947-2.287c1.561-.379 1.561-2.6 0-2.978a1.532 1.532 0 01-.947-2.287c.836-1.372-.734-2.942-2.106-2.106a1.532 1.532 0 01-2.287-.947zM10 13a3 3 0 100-6 3 3 0 000 6z" clip-rule="evenodd"/></svg>
+          Configure Tracking
+        </h2>
+      </div>
+      <label for="matters">Matters <span class="label-hint">(court/item, comma or newline separated)</span></label>
+      <textarea id="matters" placeholder="1/12&#10;8/34&#10;14/19" spellcheck="false"></textarea>
+      <div class="row">
+        <div>
+          <label for="threshold">Pre-alert window <span class="label-hint">(items before yours)</span></label>
+          <input id="threshold" type="number" min="1" max="20" value="5" />
+        </div>
+        <div class="actions">
+          <button id="save" class="btn-primary">
+            <svg viewBox="0 0 20 20" fill="currentColor" width="16" height="16"><path d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z"/></svg>
+            Save
+          </button>
+          <button id="clear" class="btn-muted">Clear</button>
+          <button id="test" class="btn-ghost">Test Alerts</button>
+        </div>
+      </div>
+      <small>Alerts fire at each step in the pre-alert window. Changes auto-save on blur.</small>
+    </section>
+
+    <!-- ── Your Alerts ── -->
+    <section class="card">
+      <div class="card-header">
+        <h2>
+          <svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18"><path d="M10 2a6 6 0 00-6 6v3.586l-.707.707A1 1 0 004 14h12a1 1 0 00.707-1.707L16 11.586V8a6 6 0 00-6-6zm0 16a2 2 0 01-2-2h4a2 2 0 01-2 2z"/></svg>
+          Your Alerts
+        </h2>
+      </div>
+      <div id="alerts" class="grid">
+        <div class="empty-state">
+          <div class="empty-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="32" height="32"><path stroke-linecap="round" stroke-linejoin="round" d="M14.857 17.082a23.848 23.848 0 005.454-1.31A8.967 8.967 0 0118 9.75v-.7V9A6 6 0 006 9v.75a8.967 8.967 0 01-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 01-5.714 0m5.714 0a3 3 0 11-5.714 0"/></svg>
+          </div>
+          Enter matters above (e.g. <code>1/12</code>) and Save to start tracking.
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Live Courts ── -->
+    <section class="card">
+      <div class="card-header">
+        <h2>
+          <svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18"><path fill-rule="evenodd" d="M4 4a2 2 0 012-2h8a2 2 0 012 2v12a1 1 0 01-1 1H5a1 1 0 01-1-1V4zm3 1h6v4H7V5zm2 8h2v2H9v-2z" clip-rule="evenodd"/></svg>
+          Live Courts
+        </h2>
+        <span class="court-count" id="court-count"></span>
+      </div>
+      <div id="courts" class="grid">
+        <div class="skeleton"></div>
+        <div class="skeleton"></div>
+        <div class="skeleton"></div>
+      </div>
+    </section>
+
+    <!-- ── Notification Log ── -->
+    <section class="card" id="log-card" style="display:none">
+      <div class="card-header">
+        <h2>
+          <svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-12a1 1 0 10-2 0v4a1 1 0 00.293.707l2.828 2.829a1 1 0 101.415-1.415L11 9.586V6z" clip-rule="evenodd"/></svg>
+          Recent Notifications
+        </h2>
+      </div>
+      <div class="notif-log" id="notif-log"></div>
+    </section>
+
+    <!-- ── Footer ── -->
+    <footer class="foot">
+      <div class="foot-row">
+        <span>Last updated: <strong id="updated">—</strong></span>
+        <span class="divider">&middot;</span>
+        <span class="credit">Built by <span class="dev-name">Ashutosh Kashyap</span></span>
+      </div>
+    </footer>
+  </main>
+
+  <!-- Toast container -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js').catch(console.error);
+      });
+    }
+  </script>
+  <script src="/app.js"></script>
+</body>
+</html>
