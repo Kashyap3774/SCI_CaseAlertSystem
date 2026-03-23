@@ -19,6 +19,8 @@ const logCard      = $('#log-card');
 const fired    = new Set();
 let pollTimer  = null;
 let lastBoard  = null;
+let coramData  = null;
+let coramTimer = null;
 const logItems = [];       // in-app notification history
 const MAX_LOG  = 30;
 
@@ -202,11 +204,48 @@ function preAlertWindow(seq, target, nBefore) {
   return arr;
 }
 
+// ── Fetch Coram (bench composition) ──
+async function fetchCoram() {
+  try {
+    const res = await fetch('/api/coram', { cache: 'no-store' });
+    if (!res.ok) return;
+    coramData = await res.json();
+    // Re-render courts with coram data if board is ready
+    if (lastBoard) {
+      const matters = parseMatters(mattersEl.value);
+      const threshold = Math.max(1, Number(thresholdEl.value) || 5);
+      renderCourts(lastBoard);
+    }
+  } catch (e) {
+    console.error('Coram fetch error:', e);
+  }
+}
+
 // ── Fetch ──
 async function fetchBoard() {
   const res = await fetch('/api/board', { cache: 'no-store' });
   if (!res.ok) throw new Error('board fetch failed');
   return res.json();
+}
+
+// ── Render: Coram helper ──
+function renderCoram(courtId) {
+  if (!coramData?.courts?.[courtId]) return '';
+  const c = coramData.courts[courtId];
+  if (!c.primaryJudges) return '';
+
+  const judges = esc(c.primaryJudges)
+    .replace(/HON&#039;BLE\s*/gi, '')
+    .replace(/HON'BLE\s*/gi, '')
+    .replace(/MR\.\s*JUSTICE\s*/gi, 'J. ')
+    .replace(/MS\.\s*JUSTICE\s*/gi, 'J. ')
+    .replace(/MRS\.\s*JUSTICE\s*/gi, 'J. ')
+    .replace(/DR\.\s*JUSTICE\s*/gi, 'J. ')
+    .replace(/THE\s+CHIEF\s+JUSTICE/gi, 'CJI');
+
+  const session = c.primarySession ? `<span class="session-tag">${esc(c.primarySession)}</span>` : '';
+
+  return `<div class="coram"><span class="judge-label">Bench</span>${judges}${session ? ' ' + session : ''}</div>`;
 }
 
 // ── Render: Courts ──
@@ -243,6 +282,7 @@ function renderCourts(data) {
       <div class="meta">Status: <strong>${esc(row.status || '—')}</strong></div>
       <div class="meta">Next: ${nextFew.length ? nextFew.join(', ') : '—'}</div>
       ${seq.length ? `<div class="progress-bar"><div class="fill" style="width:${progress}%"></div></div>` : ''}
+${renderCoram(id)}
       <details>
         <summary>Full details</summary>
         <div>${esc(row.registration || '—')}</div>
@@ -510,6 +550,11 @@ function applyTheme(dark) {
     const isDark = document.documentElement.classList.toggle('dark');
     localStorage.setItem('theme', isDark ? 'dark' : 'light');
   });
+
+  
+  // Fetch coram on load, then every 5 minutes
+  fetchCoram();
+  coramTimer = setInterval(fetchCoram, 5 * 60 * 1000);
 
   loop();
 })();
