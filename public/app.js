@@ -248,7 +248,7 @@ function renderCoram(courtId) {
       .trim();
   }).filter(Boolean);
 
-  const session = c.primarySession
+const session = c.primarySession && c.primarySession.toLowerCase() !== 'whole day'
     ? `<span class="session-tag">${esc(c.primarySession)}</span>`
     : '';
 
