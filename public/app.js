@@ -19,7 +19,6 @@ const logCard      = $('#log-card');
 const fired    = new Set();
 let pollTimer  = null;
 let lastBoard  = null;
-let firstLoad  = true;
 const logItems = [];       // in-app notification history
 const MAX_LOG  = 30;
 
@@ -360,7 +359,6 @@ async function loop() {
   try {
     const data = await fetchBoard();
     lastBoard = data;
-    firstLoad = false;
 
     updatedEl.textContent = data.updatedAt || new Date().toLocaleString();
     updatedEl.style.color = '';
@@ -399,10 +397,16 @@ function doSave() {
   setStored({ matters: mattersEl.value, threshold: thresholdEl.value });
   fired.clear();
 
-  // Visual feedback on button
+// Visual feedback on button
+  const saveSvg = saveBtn.querySelector('svg');
   saveBtn.textContent = '✓ Saved';
   saveBtn.classList.add('saved');
-  setTimeout(() => { saveBtn.textContent = 'Save'; saveBtn.classList.remove('saved'); }, 1200);
+  setTimeout(() => {
+    saveBtn.textContent = '';
+    if (saveSvg) saveBtn.appendChild(saveSvg);
+    saveBtn.appendChild(document.createTextNode(' Save'));
+    saveBtn.classList.remove('saved');
+  }, 1200);
 
   toast('Matters saved', 'success');
 
@@ -450,7 +454,6 @@ testBtn.addEventListener('click', async () => {
     const threshold = Math.max(1, Number(thresholdEl.value) || 5);
 
     let delay = 0;
-    const urgencies = ['far', 'far', 'close', 'close', 'now'];
 
     matters.forEach(m => {
       const row = lastBoard.courts[m.court];
@@ -489,6 +492,24 @@ testBtn.addEventListener('click', async () => {
 
   document.addEventListener('click', ensureAudio, { once: true });
 
-  updateBanner();
+updateBanner();
+
+  // ── Theme toggle ──
+  const themeBtn = document.getElementById('theme-toggle');
+
+
+function applyTheme(dark) {
+    document.documentElement.classList.toggle('dark', dark);
+  }
+
+  // Load saved preference, default to light
+  const savedTheme = localStorage.getItem('theme');
+  applyTheme(savedTheme === 'dark');
+
+  themeBtn.addEventListener('click', () => {
+    const isDark = document.documentElement.classList.toggle('dark');
+    localStorage.setItem('theme', isDark ? 'dark' : 'light');
+  });
+
   loop();
 })();
