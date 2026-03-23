@@ -234,18 +234,36 @@ function renderCoram(courtId) {
   const c = coramData.courts[courtId];
   if (!c.primaryJudges) return '';
 
-  const judges = esc(c.primaryJudges)
-    .replace(/HON&#039;BLE\s*/gi, '')
-    .replace(/HON'BLE\s*/gi, '')
-    .replace(/MR\.\s*JUSTICE\s*/gi, 'J. ')
-    .replace(/MS\.\s*JUSTICE\s*/gi, 'J. ')
-    .replace(/MRS\.\s*JUSTICE\s*/gi, 'J. ')
-    .replace(/DR\.\s*JUSTICE\s*/gi, 'J. ')
-    .replace(/THE\s+CHIEF\s+JUSTICE/gi, 'CJI');
+  // Clean up judge names: "HON'BLE MR. JUSTICE J.K. MAHESHWARI" → "Justice J.K. Maheshwari"
+  const raw = c.primaryJudges;
+  const judgeNames = raw.split(',').map(name => {
+    return name.trim()
+      .replace(/HON['']?BLE\s*/gi, '')
+      .replace(/MR\.\s*JUSTICE\s*/gi, 'Justice ')
+      .replace(/MS\.\s*JUSTICE\s*/gi, 'Justice ')
+      .replace(/MRS\.\s*JUSTICE\s*/gi, 'Justice ')
+      .replace(/DR\.\s*JUSTICE\s*/gi, 'Justice (Dr.) ')
+      .replace(/THE\s+CHIEF\s+JUSTICE/gi, 'Chief Justice of India')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }).filter(Boolean);
 
-  const session = c.primarySession ? `<span class="session-tag">${esc(c.primarySession)}</span>` : '';
+  const session = c.primarySession
+    ? `<span class="session-tag">${esc(c.primarySession)}</span>`
+    : '';
 
-  return `<div class="coram"><span class="judge-label">Bench</span>${judges}${session ? ' ' + session : ''}</div>`;
+  const judgeListHTML = judgeNames.map(j =>
+    `<div class="judge-name-item"><span class="judge-dot"></span>${esc(j)}</div>`
+  ).join('');
+
+  return `
+    <div class="coram">
+      <div class="bench-header">
+        <span class="bench-label">Bench</span>
+        ${session}
+      </div>
+      <div class="judge-list">${judgeListHTML}</div>
+    </div>`;
 }
 
 // ── Render: Courts ──
