@@ -721,6 +721,38 @@ html.dark .tile details { color: var(--fg); }
   .grid { grid-template-columns: repeat(3, 1fr); }
 }
 
+/* ── Court Switcher ── */
+.court-switcher {
+  display: flex;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 3px;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.court-pill {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 12px;
+  border-radius: 6px;
+  color: var(--muted);
+  text-decoration: none;
+  transition: all .15s ease;
+  white-space: nowrap;
+}
+.court-pill:hover { color: var(--fg); }
+.court-pill.active {
+  background: var(--navy-900);
+  color: var(--gold);
+  box-shadow: 0 1px 3px rgba(12,18,34,.15);
+}
+html.dark .court-pill.active {
+  background: var(--navy-600);
+  color: var(--gold);
+}
+
 /* ── Theme switch (slider) ── */
 .theme-switch {
   display: flex;
