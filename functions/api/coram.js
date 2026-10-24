@@ -5,39 +5,29 @@ const WDB_BOARD = 'https://wdb.sci.gov.in/get_board.php?ptype=c';
 const WDB_BASE  = 'https://wdb.sci.gov.in/';
 const CORAM_CACHE_TTL = 300; // 5 minutes
 
-function extractCourtLinks(html) {
+// Pairs each detail link with the nearest court id (id="cl_N") before it, so a
+// court with no link (not sitting) doesn't shift every later court by one.
+export function extractCourtLinks(html) {
+  const re = /id="cl_(\d+)"|<a\s+[^>]*href="(display_court_all_cases\.php\?[^"]+)"/gi;
   const courts = [];
-  // Match: <a href="display_court_all_cases.php?TOKEN">
-  // Court number is in nearby <td> — but simpler: get all detail links + court numbers from the rows
-  const rowRe = /<tr[^>]*>\s*<td[^>]*>\s*<td[^>]*>[\s\S]*?<a\s+href="(display_court_all_cases\.php\?[^"]+)"[\s\S]*?<\/tr>/gi;
-  
-  // Simpler approach: extract all unique detail links and court numbers
-  const linkRe = /<a\s+[^>]*href="(display_court_all_cases\.php\?[^"]+)"[^>]*>/gi;
-  const links = [];
+  const seen = new Set();
+  let court = null;
   let m;
-  while ((m = linkRe.exec(html)) !== null) {
-    const url = m[1];
-    if (!links.includes(url)) links.push(url);
+  while ((m = re.exec(html)) !== null) {
+    if (m[1]) { court = m[1]; continue; }
+    if (court && !seen.has(court)) {
+      seen.add(court);
+      courts.push({ court, url: WDB_BASE + m[2] });
+    }
   }
-
-  // Court numbers: look for <td ... id="cl_X" — where X is court number
-  const courtNums = [];
-  const idRe = /id="cl_(\d+)"/gi;
-  while ((m = idRe.exec(html)) !== null) {
-    if (!courtNums.includes(m[1])) courtNums.push(m[1]);
-  }
-
-  // Each court link corresponds to a court number (in order)
-  // Also try to get court number from the link's preceding <td>
-  // Fallback: pair links with court numbers by order
-  return courtNums.map((num, i) => ({
-    court: num,
-    url: links[i] ? WDB_BASE + links[i] : null,
-  })).filter(c => c.url);
+  return courts;
 }
 
-function parseCoramFromDetail(html) {
-  const result = { coram: [], session: null };
+// Same ids as /api/board: registrar courts 21/22 are RC1/RC2.
+const courtKey = (n) => (n === '21' ? 'RC1' : n === '22' ? 'RC2' : n);
+
+export function parseCoramFromDetail(html) {
+  const result = { coram: [] };
 
   // Extract all [Coram : ...] blocks
   const coramRe = /\[Coram\s*:\s*([^\]]+)\]/gi;
@@ -53,15 +43,15 @@ function parseCoramFromDetail(html) {
     });
   }
 
-  // Also grab the court number from the page
-  const courtMatch = html.match(/COURT\s*[-–—]\s*(\d+)/i);
+  // Also grab the court number from the page ("REGISTRAR COURT - 1" is not Court 1)
+  const courtMatch = html.match(/(?<!REGISTRAR\s*)COURT\s*[-–—]\s*(\d+)/i);
   if (courtMatch) result.courtNumber = courtMatch[1];
 
   return result;
 }
 
 export async function onRequest(context) {
-  const { request, env } = context;
+  const { request } = context;
 
   const corsHeaders = {
     'Access-Control-Allow-Origin': '*',
@@ -113,12 +103,12 @@ export async function onRequest(context) {
             'Referer': 'https://wdb.sci.gov.in/display_original.php',
           },
         });
-        if (!res.ok) return { court: c.court, coram: [], session: null };
+        if (!res.ok) return { court: c.court, coram: [] };
         const html = await res.text();
         const parsed = parseCoramFromDetail(html);
         return { court: c.court, ...parsed };
       } catch {
-        return { court: c.court, coram: [], session: null };
+        return { court: c.court, coram: [] };
       }
     });
 
@@ -127,7 +117,7 @@ export async function onRequest(context) {
     // Build response object keyed by court number
     const courts = {};
     for (const r of results) {
-      const id = r.courtNumber || r.court;
+      const id = courtKey(r.courtNumber || r.court);
       courts[id] = {
         coram: r.coram || [],
         // Flatten for simple display: primary bench
