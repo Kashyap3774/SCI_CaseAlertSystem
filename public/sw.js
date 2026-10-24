@@ -1,17 +1,17 @@
-// public/sw.js — Service Worker with offline shell caching
+// public/sw.js — offline app shell + notification clicks
+// Bump CACHE_NAME whenever the shell files change.
 
-const CACHE_NAME = 'sc-alerts-v2';
+const CACHE_NAME = 'sc-alerts-v3';
 const SHELL_ASSETS = [
   '/',
-  '/index.html',
   '/style.css',
   '/app.js',
+  '/logic.js',
   '/manifest.webmanifest',
   '/icons/icon-192.png',
   '/icons/icon-512.png',
 ];
 
-// Install: cache the app shell
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE_NAME)
@@ -20,47 +20,57 @@ self.addEventListener('install', (event) => {
   );
 });
 
-// Activate: clean up old caches
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)))
-    ).then(() => self.clients.claim())
+    caches.keys()
+      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k))))
+      .then(() => self.clients.claim())
   );
 });
 
-// Fetch: network-first for API, cache-first for shell
+function cacheCopy(request, response) {
+  if (response.ok) {
+    const copy = response.clone();
+    caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
+  }
+  return response;
+}
+
 self.addEventListener('fetch', (event) => {
-  const url = new URL(event.request.url);
+  const { request } = event;
+  const url = new URL(request.url);
 
-  // API calls: always go to network (never serve stale data)
-  if (url.pathname.startsWith('/api/')) return;
+  // Only our own static files; live data (/api/) and other sites go straight to the network
+  if (request.method !== 'GET' || url.origin !== self.location.origin) return;
+  if (url.pathname.startsWith('/api/') || url.pathname === '/healthz') return;
 
-  // Static assets: try cache first, then network, update cache
+  // Page: network first so a new deploy shows up immediately; cached copy when offline
+  if (request.mode === 'navigate') {
+    event.respondWith(
+      fetch(request)
+        .then((response) => cacheCopy('/', response))
+        .catch(() => caches.match('/'))
+    );
+    return;
+  }
+
+  // Other files: serve cached copy instantly, refresh it in the background
   event.respondWith(
-    caches.match(event.request).then((cached) => {
-      const networkFetch = fetch(event.request).then((response) => {
-        if (response.ok) {
-          const clone = response.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
-        }
-        return response;
-      }).catch(() => cached); // if offline, use cached
-
-      return cached || networkFetch;
+    caches.match(request).then((cached) => {
+      const network = fetch(request).then((response) => cacheCopy(request, response)).catch(() => cached);
+      return cached || network;
     })
   );
 });
 
-// Notification click: focus or open the app
+// Notification click: bring the app to the front (or open it)
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
   event.waitUntil(
     (async () => {
-      const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-      const appUrl = new URL('/', self.location.origin).href;
-      for (const client of all) {
-        if (client.url === appUrl && 'focus' in client) return client.focus();
+      const windows = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+      for (const client of windows) {
+        if (client.url.startsWith(self.location.origin) && 'focus' in client) return client.focus();
       }
       if (self.clients.openWindow) return self.clients.openWindow('/');
     })()

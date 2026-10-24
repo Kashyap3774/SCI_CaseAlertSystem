@@ -1,10 +1,12 @@
 {
-  "name": "SC Noticeboard Alerts",
+  "name": "SC Case Alerts",
   "short_name": "SC Alerts",
+  "description": "Get alerted as your case gets close in the Supreme Court of India.",
   "start_url": "/",
+  "scope": "/",
   "display": "standalone",
-  "background_color": "#0b1320",
-  "theme_color": "#0b1320",
+  "background_color": "#0c1222",
+  "theme_color": "#0c1222",
   "icons": [
     { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
     { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png" }
