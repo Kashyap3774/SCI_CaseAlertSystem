@@ -1,161 +1,102 @@
-# SC Case Alert System — Cloudflare Pages Deployment Guide
+# SC Case Alerts — Deployment Guide (Cloudflare Pages)
 
-## What Changed from Express → Cloudflare Pages
+A small web app that watches the Supreme Court of India's live display board and alerts you
+(sound, vibration, pop-up notification) as your case gets close. No build step and no npm
+dependencies: static files in `public/`, three small Cloudflare Pages Functions in `functions/`.
 
-| Component | Express (original) | Cloudflare Pages |
-|---|---|---|
-| Static files | `express.static('public')` | Served automatically from `public/` |
-| API `/api/board` | Express route in `server.js` | `functions/api/board.js` (Pages Function) |
-| Caching | In-memory JS variable | Cloudflare Edge Cache API |
-| Auth | `Buffer.from(token, 'base64')` | `atob(token)` (Workers-compatible) |
-| Env vars | `.env` file + `dotenv` | Cloudflare dashboard (Settings → Variables) |
-| Runtime | Node.js 18+ | Cloudflare Workers (V8 isolate) |
+## How it fits together
 
-**No npm dependencies needed** — the Pages Function is pure JavaScript.
+| Path | What it does |
+|---|---|
+| `/` (`public/`) | The app. Polls `/api/board` every 10 s and `/api/coram` every 5 min. Cases are saved in the browser. |
+| `/api/board` (`functions/api/board.js`) | Fetches `cdb.sci.gov.in` (JSON), normalizes it. Edge-cached for `CACHE_TTL_SECONDS`. Courts 21/22 are returned as `RC1`/`RC2` (Registrar Courts). |
+| `/api/coram` (`functions/api/coram.js`) | Scrapes the bench (judges) from `wdb.sci.gov.in` (HTML). Edge-cached 5 min. |
+| `/healthz` (`functions/healthz.js`) | Returns `{"ok":true}`. |
+| `functions/_middleware.js` | Optional password for the whole site (see `AUTH_USER` / `AUTH_PASS`). |
 
----
-
-## Prerequisites
-
-- A free Cloudflare account (https://dash.cloudflare.com/sign-up)
-- Git installed locally
-- Node.js 18+ (only needed for local testing with Wrangler)
+**Important limit:** alerts only work while the page is open (another tab is fine). Browsers may
+slow down checks in background tabs, and a locked phone may pause the page; the app offers a
+"Keep screen on" switch where the browser supports it. On iPhone/iPad, notifications only work
+after "Add to Home Screen". There is no server-side push.
 
 ---
 
-## Step-by-Step Deployment
+## Deploy
 
-### STEP 1 — Push to GitHub/GitLab
-
-```bash
-cd sc-deploy
-git init
-git add .
-git commit -m "Initial: SC Case Alerts for Cloudflare Pages"
-git remote add origin https://github.com/YOUR_USERNAME/sc-case-alerts.git
-git push -u origin main
-```
-
-### STEP 2 — Create a Cloudflare Pages Project
-
-1. Go to https://dash.cloudflare.com
-2. Left sidebar → **Workers & Pages**
-3. Click **Create**
-4. Tab: **Pages** → **Connect to Git**
-5. Authorize GitHub/GitLab if prompted
-6. Select your **sc-case-alerts** repository
-7. Configure build settings:
-   - **Project name**: `sc-case-alerts` (this becomes your subdomain)
-   - **Production branch**: `main`
-   - **Framework preset**: `None`
-   - **Build command**: *(leave empty — no build step needed)*
+1. Push this repository to GitHub/GitLab.
+2. Cloudflare dashboard → **Workers & Pages** → **Create** → **Pages** → **Connect to Git** → pick the repo.
+3. Build settings:
+   - **Framework preset**: None
+   - **Build command**: *(leave empty)*
    - **Build output directory**: `public`
-8. Click **Save and Deploy**
+4. **Save and Deploy**. The `functions/` folder at the repo root is picked up automatically.
 
-### STEP 3 — Set Environment Variables
+### Environment variables (Settings → Variables)
 
-After the first deploy:
-
-1. Go to your Pages project in the dashboard
-2. **Settings** → **Environment Variables**
-3. Add these variables for **Production** (and optionally Preview):
-
-| Variable | Value | Required? |
+| Variable | Default | Purpose |
 |---|---|---|
-| `COURTS_CSV` | `1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,21,22` | Optional (has default) |
-| `CACHE_TTL_SECONDS` | `8` | Optional (has default) |
-| `AUTH_USER` | your-username | Optional (skip = open access) |
-| `AUTH_PASS` | your-password | Optional (skip = open access) |
+| `COURTS_CSV` | `1,…,17,21,22` | Courts requested from SCI |
+| `CACHE_TTL_SECONDS` | `8` | Edge cache for `/api/board` |
+| `AUTH_USER` + `AUTH_PASS` | *(unset = open)* | Set **both** to password-protect the whole site. `/healthz`, the manifest, icons and `sw.js` stay open. |
 
-4. Click **Save**
-5. Go to **Deployments** → click **⟳ Retry deployment** on the latest deployment (so it picks up the new vars)
+After changing variables, redeploy (Deployments → Retry deployment).
 
-### STEP 4 — Add Your Custom Icons (Optional)
+### Verify
 
-Replace the placeholder icons:
-- `public/icons/icon-192.png` (192×192 px)
-- `public/icons/icon-512.png` (512×512 px)
-
-Commit and push — Cloudflare auto-deploys on every push.
-
-### STEP 5 — Verify
-
-Your app is now live at:
-```
-https://sc-case-alerts.pages.dev
-```
-
-Test these:
-- [ ] Homepage loads with the ticker and court tiles
-- [ ] `/api/board` returns JSON data from SCI
+- [ ] Home page loads, "Live · checked at …" appears under the header
+- [ ] `/api/board` returns JSON with a `courts` object
 - [ ] `/healthz` returns `{"ok":true}`
-- [ ] Notifications work (click Test after entering a matter)
-- [ ] PWA install prompt appears on mobile
+- [ ] Add a case, press **Test my alerts**: you hear beeps and see notifications
+- [ ] On a phone, "Add to Home Screen" installs the app
 
 ---
 
-## Optional: Custom Domain
+## Local development
 
-1. Pages project → **Custom Domains**
-2. Click **Set up a custom domain**
-3. Enter your domain (e.g., `alerts.yourdomain.com`)
-4. Cloudflare auto-provisions SSL (takes ~2 minutes)
-
----
-
-## Optional: Local Development
+Needs a recent Node.js (tests were run with Node 22.22; older versions may not load the `.js` modules without a `package.json`).
 
 ```bash
-# Install Wrangler (Cloudflare's CLI)
-npm install -g wrangler
-
-# Login to Cloudflare
-wrangler login
-
-# Run locally (serves public/ and functions/)
-npx wrangler pages dev public
-
-# App runs at http://localhost:8788
+npx wrangler pages dev public      # http://localhost:8788 (reads [vars] from wrangler.toml)
+node --test                        # unit tests in tests/
 ```
 
-For auth testing locally, create `.dev.vars`:
+For a local password, create `.dev.vars` (git-ignored):
+
 ```
 AUTH_USER=test
 AUTH_PASS=test
 ```
 
----
+## When you change the app
+
+- Shell files (`index.html`, `app.js`, `logic.js`, `style.css`, icons) are cached by the service
+  worker. **Bump `CACHE_NAME` in `public/sw.js`** whenever you change them; the page itself is
+  fetched network-first, so new deploys show up on the next load.
+- Logic that decides a case's status lives in `public/logic.js` and is covered by `tests/logic.test.mjs`.
+- The SCI parsers (`parseSequence`, `extractCourtLinks`, `parseCoramFromDetail`) are written against
+  formats seen so far; if SCI changes its pages, start with `tests/board.test.mjs` / `tests/coram.test.mjs`.
 
 ## Troubleshooting
 
 | Issue | Fix |
 |---|---|
-| `/api/board` returns 502 | Check if `cdb.sci.gov.in` is accessible; verify COURTS_CSV value |
-| Auth not working | Ensure both AUTH_USER and AUTH_PASS are set; redeploy after adding vars |
-| Notifications don't fire | Allow notifications in browser; click any button first (audio policy) |
-| Stale data | Cache TTL is 8s by default; hard-refresh or wait |
-| Functions not running | Verify `functions/` directory is at repo root (not inside `public/`) |
-| "Build output directory" error | Must be set to `public` (not `.` or `dist`) |
+| "Court board is not responding" | `cdb.sci.gov.in` is down or slow; `/api/board` returns 502/500. Check `COURTS_CSV`. |
+| Bench (judges) missing | `/api/coram` could not read `wdb.sci.gov.in`; the rest of the app still works. |
+| Password prompt never appears | Set **both** `AUTH_USER` and `AUTH_PASS`, then redeploy. |
+| No notifications | The Alerts box shows the exact state and how to fix it (allow in browser settings; on iPhone add to Home Screen first). |
+| No sound | Browsers allow sound only after one tap on the page; check the Sound switch is on. |
+| Old version after deploy | Reload once; if it persists, bump `CACHE_NAME` in `public/sw.js`. |
 
----
-
-## File Structure Reference
+## Files
 
 ```
-sc-case-alerts/
-├── functions/            ← Cloudflare Pages Functions (API)
-│   ├── api/
-│   │   └── board.js      ← /api/board endpoint
-│   └── healthz.js        ← /healthz endpoint
-├── public/               ← Static site (served as root)
-│   ├── icons/
-│   │   ├── icon-192.png
-│   │   └── icon-512.png
-│   ├── app.js
-│   ├── index.html
-│   ├── manifest.webmanifest
-│   ├── style.css
-│   └── sw.js
-├── .gitignore
-└── wrangler.toml         ← Local dev config
+functions/
+  _middleware.js        optional site password
+  api/board.js          /api/board
+  api/coram.js          /api/coram
+  healthz.js            /healthz
+public/
+  index.html  style.css  app.js  logic.js  sw.js  manifest.webmanifest  icons/
+tests/                  node --test
+wrangler.toml           local dev vars
 ```

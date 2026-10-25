@@ -1,578 +1,803 @@
-// public/app.js — SC Case Alert System (improved)
+// public/app.js — SC Case Alerts (UI). Pure logic lives in ./logic.js.
+
+import {
+  normalizeCourt, courtLabel, parseItem, clampAlertAhead, migrateLegacyMatters,
+  caseStatus, dueAlerts, nextItems, formatJudgeName, DEFAULT_ALERT_AHEAD,
+} from './logic.js';
+
+const POLL_MS = 10_000;
+const CORAM_MS = 5 * 60_000;
+const DEFAULT_COURTS = [...Array.from({ length: 17 }, (_, i) => String(i + 1)), 'RC1', 'RC2'];
+const ALERT_AHEAD_CHOICES = [1, 2, 3, 4, 5, 6, 8, 10, 15, 20];
+const MAX_LOG = 30;
 
 const $ = (sel) => document.querySelector(sel);
-const mattersEl    = $('#matters');
-const thresholdEl  = $('#threshold');
-const alertsEl     = $('#alerts');
-const courtsEl     = $('#courts');
-const updatedEl    = $('#updated');
-const saveBtn      = $('#save');
-const clearBtn     = $('#clear');
-const testBtn      = $('#test');
-const pulseEl      = $('#pulse');
-const statusTextEl = $('#status-text');
-const toastBox     = $('#toast-container');
-const notifBanner  = $('#notif-banner');
-const notifLog     = $('#notif-log');
-const logCard      = $('#log-card');
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
-const fired    = new Set();
-let pollTimer  = null;
-let lastBoard  = null;
-let coramData  = null;
-let coramTimer = null;
-const logItems = [];       // in-app notification history
-const MAX_LOG  = 30;
-
-// ── HTML escape (defense-in-depth) ──
-function esc(s) {
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
+// Replace an element's HTML only when it actually changed, so open panels,
+// focus and scroll position survive the 10-second refresh.
+function patch(el, html) {
+  if (el.__html !== html) { el.innerHTML = html; el.__html = html; }
 }
 
-// ── Toast system ──
-function toast(msg, type = '') {
-  const el = document.createElement('div');
-  el.className = `toast ${type}`;
-  el.textContent = msg;
-  toastBox.appendChild(el);
-  setTimeout(() => el.remove(), 2600);
-}
+// ── Storage that never throws (some browsers block it); falls back to memory ──
+const store = (() => {
+  const mem = new Map();
+  let persistent = true;
+  try { localStorage.setItem('__probe', '1'); localStorage.removeItem('__probe'); } catch { persistent = false; }
+  return {
+    persistent,
+    get(key, fallback = null) {
+      if (persistent) { try { const v = localStorage.getItem(key); if (v !== null) return v; } catch {} }
+      return mem.has(key) ? mem.get(key) : fallback;
+    },
+    set(key, value) {
+      mem.set(key, String(value));
+      if (persistent) { try { localStorage.setItem(key, String(value)); } catch {} }
+    },
+    remove(key) {
+      mem.delete(key);
+      if (persistent) { try { localStorage.removeItem(key); } catch {} }
+    },
+  };
+})();
 
-// ── Audio ──
-let audioCtx = null;
-function ensureAudio() {
-  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
-}
-
-// Urgency-aware beep: closer → higher pitch, longer, louder
-function beep(urgency = 'far') {
+function loadCases() {
   try {
-    if (!audioCtx) return;
-    const profiles = {
-      far:   { freq: 660,  dur: 300, vol: 0.06, count: 1 },
-      close: { freq: 880,  dur: 400, vol: 0.10, count: 2 },
-      now:   { freq: 1100, dur: 500, vol: 0.14, count: 3 },
-    };
-    const p = profiles[urgency] || profiles.far;
+    const saved = JSON.parse(store.get('cases', 'null'));
+    if (Array.isArray(saved)) {
+      return saved
+        .map((c) => ({ court: normalizeCourt(c?.court), item: parseItem(c?.item) }))
+        .filter((c) => c.court && c.item);
+    }
+  } catch {}
+  // First run after the redesign: carry over the old free-text list
+  const migrated = migrateLegacyMatters(store.get('matters', ''));
+  if (migrated.length) {
+    store.set('cases', JSON.stringify(migrated));
+    const oldThreshold = store.get('threshold');
+    if (oldThreshold) store.set('alertAhead', clampAlertAhead(oldThreshold));
+  }
+  store.remove('matters');
+  store.remove('threshold');
+  return migrated;
+}
 
+const state = {
+  cases: loadCases(),
+  alertAhead: clampAlertAhead(store.get('alertAhead', DEFAULT_ALERT_AHEAD)),
+  soundOn: store.get('soundOn', '1') === '1',
+  wakeWanted: store.get('keepScreenOn', '0') === '1',
+  onlyMine: store.get('onlyMine', '0') === '1',
+  board: null,
+  coram: null,
+  lastOk: null,
+  error: null, // null | 'offline' | 'server' | 'auth'
+  fired: new Set(),
+  log: [],
+};
+
+const saveCases = () => store.set('cases', JSON.stringify(state.cases));
+const caseKey = (c) => `${c.court}/${c.item}`;
+
+// ═══════════════════════════════════════════════════════════════
+// Sound, vibration, notifications
+// ═══════════════════════════════════════════════════════════════
+
+let audioCtx = null;
+function unlockAudio() {
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume().then(renderSetup, () => {});
+  } catch {}
+  renderSetup();
+}
+const audioReady = () => audioCtx?.state === 'running';
+
+const SOUND = {
+  near:  { freq: 660,  dur: 0.30, vol: 0.06, count: 1 },
+  close: { freq: 880,  dur: 0.40, vol: 0.10, count: 2 },
+  now:   { freq: 1100, dur: 0.50, vol: 0.14, count: 3 },
+};
+function beep(level) {
+  if (!state.soundOn || !audioReady()) return;
+  const p = SOUND[level] || SOUND.near;
+  try {
     for (let i = 0; i < p.count; i++) {
-      const startAt = audioCtx.currentTime + i * (p.dur / 1000 + 0.08);
+      const t = audioCtx.currentTime + i * (p.dur + 0.08);
       const o = audioCtx.createOscillator();
       const g = audioCtx.createGain();
       o.type = 'sine';
-      o.frequency.value = p.freq + i * 60; // slight pitch climb per repeat
+      o.frequency.value = p.freq + i * 60; // slight climb per repeat
       o.connect(g);
       g.connect(audioCtx.destination);
-      g.gain.setValueAtTime(0.0001, startAt);
-      g.gain.exponentialRampToValueAtTime(p.vol, startAt + 0.02);
-      o.start(startAt);
-      g.gain.exponentialRampToValueAtTime(0.0001, startAt + p.dur / 1000);
-      o.stop(startAt + p.dur / 1000 + 0.01);
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(p.vol, t + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + p.dur);
+      o.start(t);
+      o.stop(t + p.dur + 0.01);
     }
   } catch {}
 }
 
-function vibrate(urgency = 'far') {
-  if (!navigator.vibrate) return;
-  const patterns = {
-    far:   [120],
-    close: [150, 80, 150],
-    now:   [200, 100, 200, 100, 300],
-  };
-  try { navigator.vibrate(patterns[urgency] || patterns.far); } catch {}
+const VIBRATE = { near: [120], close: [150, 80, 150], now: [200, 100, 200, 100, 300] };
+function vibrate(level) {
+  if (navigator.userActivation && !navigator.userActivation.hasBeenActive) return; // blocked before the first tap
+  try { navigator.vibrate?.(VIBRATE[level] || VIBRATE.near); } catch {}
 }
 
-// ── Notifications ──
-async function ensurePermission() {
-  if (!('Notification' in window)) return false;
-  if (Notification.permission === 'granted') return true;
-  if (Notification.permission === 'denied') return false;
-  const p = await Notification.requestPermission();
-  return p === 'granted';
+const notifSupported = () => 'Notification' in window;
+const isIOS = () =>
+  (/iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)) &&
+  !window.matchMedia?.('(display-mode: standalone)')?.matches;
+
+async function askNotificationPermission() {
+  if (!notifSupported() || Notification.permission !== 'default') return;
+  try { await Notification.requestPermission(); } catch {}
+  renderSetup();
 }
 
-function updateBanner() {
-  if (!('Notification' in window) || Notification.permission === 'granted') {
-    notifBanner.classList.remove('show');
-    return;
-  }
-  // Don't show if user dismissed this session
-  if (sessionStorage.getItem('banner-dismissed')) return;
-  notifBanner.classList.add('show');
-}
-
-$('#enable-notif')?.addEventListener('click', async () => {
-  const ok = await ensurePermission();
-  updateBanner();
-  if (ok) toast('Notifications enabled!', 'success');
-  else toast('Notifications blocked. Check browser settings.', 'error');
-});
-$('#dismiss-banner')?.addEventListener('click', () => {
-  notifBanner.classList.remove('show');
-  sessionStorage.setItem('banner-dismissed', '1');
-});
-
-async function showNativeNotification(title, body, urgency = 'far') {
-  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+async function showSystemNotification(title, body, level, tag) {
+  if (!notifSupported() || Notification.permission !== 'granted') return;
   const opts = {
     body,
-    tag: title,
+    tag,
     renotify: true,
-    requireInteraction: urgency === 'now',  // NOW stays until dismissed
+    requireInteraction: level === 'now', // "now" stays until dismissed
     icon: '/icons/icon-192.png',
     badge: '/icons/icon-192.png',
-    vibrate: urgency === 'now' ? [200, 100, 200, 100, 300]
-           : urgency === 'close' ? [150, 80, 150]
-           : [120],
+    vibrate: VIBRATE[level],
   };
-
   try {
-    const reg = await navigator.serviceWorker.ready;
-    await reg.showNotification(title, opts);
-  } catch {
-    try { new Notification(title, { body }); } catch {}
-  }
+    // getRegistration() resolves even when no worker is installed (ready would hang)
+    const reg = await navigator.serviceWorker?.getRegistration();
+    if (reg) return await reg.showNotification(title, opts);
+  } catch {}
+  try { new Notification(title, { body, tag }); } catch {}
 }
 
-function addToLog(title, body) {
+function alertText(a) {
+  const where = courtLabel(a.court);
+  if (a.state === 'now') {
+    return { title: `${where}: your case is on now`, body: `Item ${a.item} is being heard now.` };
+  }
+  if (a.state === 'close') {
+    return { title: `${where}: get ready`, body: `${plural(a.ahead, 'case')} before your item ${a.item}. Now hearing item ${a.current}.` };
+  }
+  return { title: `${where}: ${plural(a.ahead, 'case')} before yours`, body: `Your item ${a.item} is coming up. Now hearing item ${a.current}.` };
+}
+
+function fireAlert(a, { test = false } = {}) {
+  const { title, body } = alertText(a);
+  const fullTitle = test ? `Test: ${title}` : title;
+  beep(a.state);
+  vibrate(a.state);
+  addToLog(fullTitle, body, a.state);
+  $('#announcer').textContent = `${fullTitle}. ${body}`;
+  showSystemNotification(fullTitle, body, a.state, test ? `test-${a.state}` : `case-${a.court}-${a.item}`);
+}
+
+function addToLog(title, body, level) {
   const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  logItems.unshift({ title, body, time });
-  if (logItems.length > MAX_LOG) logItems.pop();
+  state.log.unshift({ title, body, level, time });
+  if (state.log.length > MAX_LOG) state.log.pop();
   renderLog();
 }
-function renderLog() {
-  if (!logItems.length) { logCard.style.display = 'none'; return; }
-  logCard.style.display = '';
-  notifLog.innerHTML = logItems.map(l =>
-    `<div class="notif-log-item"><span>${esc(l.title)} — ${esc(l.body)}</span><span class="time">${l.time}</span></div>`
-  ).join('');
-}
 
-async function notify(title, body, urgency = 'far') {
-  ensureAudio();
-  beep(urgency);
-  vibrate(urgency);
-  addToLog(title, body);
+// ═══════════════════════════════════════════════════════════════
+// Keep screen on (Screen Wake Lock)
+// ═══════════════════════════════════════════════════════════════
 
-  const ok = await ensurePermission();
-  if (!ok) { updateBanner(); return; }
-  showNativeNotification(title, body, urgency);
-}
+let wakeLock = null;
+let wakeRefused = false; // the browser said no (e.g. battery saver)
+const wakeSupported = () => 'wakeLock' in navigator;
 
-// ── Storage & parsing ──
-function getStored() {
+async function applyWakeLock() {
+  if (!wakeSupported()) return renderSetup();
   try {
-    return {
-      matters: localStorage.getItem('matters') || '',
-      threshold: Number(localStorage.getItem('threshold') || '5')
-    };
-  } catch { return { matters: '', threshold: 5 }; }
-}
-function setStored({ matters, threshold }) {
-  try {
-    localStorage.setItem('matters', matters);
-    localStorage.setItem('threshold', String(threshold));
-  } catch {}
-}
-
-function parseMatters(input) {
-  return input
-    .split(/[,\n]/)
-    .map(s => s.trim())
-    .filter(Boolean)
-    .map(s => {
-      const [c, it] = s.split('/').map(x => x.trim());
-      const court = c.replace(/^C/i, '').toUpperCase();
-      if (court === 'RC1' || court === 'RC2') return { court, item: Number(it) };
-      return { court: String(parseInt(court, 10)), item: Number(it) };
-    })
-    .filter(m => Number.isFinite(m.item));
-}
-
-function preAlertWindow(seq, target, nBefore) {
-  const idx = seq.indexOf(target);
-  if (idx >= 0) {
-    const start = Math.max(0, idx - nBefore);
-    return seq.slice(start, idx + 1);
+    if (state.wakeWanted && !wakeLock && document.visibilityState === 'visible') {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeRefused = false;
+      wakeLock.addEventListener('release', () => { wakeLock = null; renderSetup(); });
+    } else if (!state.wakeWanted) {
+      wakeRefused = false;
+      if (wakeLock) { await wakeLock.release(); wakeLock = null; }
+    }
+  } catch {
+    wakeLock = null;
+    wakeRefused = state.wakeWanted;
   }
-  const start = Math.max(1, target - nBefore);
-  const arr = [];
-  for (let v = start; v <= target; v++) arr.push(v);
-  return arr;
+  renderSetup();
 }
 
-// ── Fetch Coram (bench composition) ──
+// ═══════════════════════════════════════════════════════════════
+// Toasts
+// ═══════════════════════════════════════════════════════════════
+
+function toast(message, { type = '', action = null, duration = 3000 } = {}) {
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.textContent = message;
+  if (action) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'toast-action';
+    btn.textContent = action.label;
+    btn.addEventListener('click', () => { action.onClick(); el.remove(); });
+    el.appendChild(btn);
+  }
+  $('#toast-container').appendChild(el);
+  setTimeout(() => el.remove(), duration);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Rendering
+// ═══════════════════════════════════════════════════════════════
+
+const STATUS_COPY = {
+  'not-started': () => ({ title: "Court hasn't started yet", hint: 'We will start tracking as soon as the court begins.' }),
+  waiting: (s) => ({ title: `${plural(s.ahead, 'case')} before yours`, hint: `We will alert you when it is ${plural(state.alertAhead, 'case')} away.` }),
+  near: (s) => ({ title: `${plural(s.ahead, 'case')} before yours`, hint: 'Coming up. Keep this page open.' }),
+  close: (s) => ({ title: `Get ready: ${plural(s.ahead, 'case')} before yours`, hint: 'Make your way to the court now.' }),
+  now: () => ({ title: 'Your case is being heard now', hint: 'Go in now.' }),
+  passed: () => ({ title: 'The court has moved past your item', hint: 'If your case was passed over, it may be called again later.' }),
+  'not-listed': () => ({ title: 'Not in the court’s announced order', hint: 'Check the item number. We will keep watching in case it is added.' }),
+  'off-order': () => ({ title: 'Court is taking another matter', hint: 'It is outside the announced order. We will keep watching.' }),
+  loading: () => ({ title: 'Checking the court board…', hint: '' }),
+};
+
+function statusFor(c) {
+  if (!state.board) return { state: 'loading', ahead: null, current: null };
+  return caseStatus(state.board.courts?.[c.court], c.item, state.alertAhead);
+}
+
+const caseCards = new Map(); // caseKey → element
+
+function renderCases() {
+  const list = $('#case-list');
+  const keys = new Set(state.cases.map(caseKey));
+
+  for (const [key, el] of caseCards) {
+    if (!keys.has(key)) { el.remove(); caseCards.delete(key); }
+  }
+
+  if (!state.cases.length) {
+    patch(list, `<div class="empty-state">
+      <p class="empty-title">No cases yet</p>
+      <p>Add one above, for example <strong>Court 3</strong>, item <strong>12</strong>.<br>Or tap <strong>Track a case here</strong> on any court below.</p>
+    </div>`);
+    return;
+  }
+  if (list.querySelector('.empty-state')) { list.innerHTML = ''; list.__html = null; }
+
+  for (const c of state.cases) {
+    const key = caseKey(c);
+    let card = caseCards.get(key);
+    if (!card) {
+      card = document.createElement('article');
+      card.className = 'case-card';
+      card.innerHTML = `
+        <div class="case-head">
+          <span class="case-id"><span class="case-court">${esc(courtLabel(c.court))}</span><span class="case-item">Item ${c.item}</span></span>
+          <button type="button" class="icon-btn" data-remove="${esc(key)}" aria-label="Stop tracking ${esc(courtLabel(c.court))}, item ${c.item}" title="Remove">
+            <svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18" aria-hidden="true"><path fill-rule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clip-rule="evenodd"/></svg>
+          </button>
+        </div>
+        <div class="case-body"></div>`;
+      caseCards.set(key, card);
+    }
+    list.appendChild(card); // keeps cards in the user's order
+
+    const s = statusFor(c);
+    const copy = STATUS_COPY[s.state](s);
+    card.dataset.state = s.state;
+    patch(card.querySelector('.case-body'), `
+      <p class="case-status">${esc(copy.title)}</p>
+      ${copy.hint ? `<p class="case-hint">${esc(copy.hint)}</p>` : ''}
+      <div class="case-nums">
+        <div><span class="num-label">Now hearing</span><span class="num">${s.current ?? '–'}</span></div>
+        <div><span class="num-label">Your item</span><span class="num">${c.item}</span></div>
+      </div>`);
+  }
+}
+
+function renderHotBanner() {
+  const banner = $('#hot-banner');
+  const hot = state.cases
+    .map((c) => ({ ...c, ...statusFor(c) }))
+    .filter((s) => s.state === 'now' || s.state === 'close')
+    .sort((a, b) => a.ahead - b.ahead);
+
+  if (!hot.length) {
+    banner.hidden = true;
+    document.title = 'SC Case Alerts · Supreme Court of India';
+    return;
+  }
+  const top = hot[0];
+  const text = top.state === 'now'
+    ? `${courtLabel(top.court)}, item ${top.item}: your case is being heard now`
+    : `${courtLabel(top.court)}, item ${top.item}: ${plural(top.ahead, 'case')} before yours. Get ready.`;
+  banner.hidden = false;
+  banner.dataset.state = top.state;
+  patch(banner, `<span class="hot-dot" aria-hidden="true"></span><span>${esc(text)}</span>`);
+  // Visible in the browser tab even when you're on another tab
+  document.title = top.state === 'now' ? `NOW: ${courtLabel(top.court)} item ${top.item}` : `${top.ahead} before yours · ${courtLabel(top.court)}`;
+}
+
+function chipFor(row) {
+  if (!row || row.current == null) return { cls: 'idle', text: 'Not started' };
+  const raw = (row.status || '').trim();
+  const up = raw.toUpperCase();
+  const text = raw ? raw.charAt(0).toUpperCase() + raw.slice(1).toLowerCase() : 'In session';
+  if (up.includes('HEAR')) return { cls: 'hearing', text };
+  if (up.includes('MENTION')) return { cls: 'mention', text };
+  return { cls: 'sitting', text };
+}
+
+function benchHTML(courtId) {
+  const benches = (state.coram?.courts?.[courtId]?.coram || []).filter((b) => b.judges);
+  if (!benches.length) return '';
+  return `<div class="bench">
+    <span class="bench-label">Bench</span>
+    ${benches.map((b) => {
+      const session = b.session && !/^whole day$/i.test(b.session)
+        ? `<span class="session-tag">${esc(b.session.replace(/\s*:\s*/, ': '))}</span>` : '';
+      const judges = b.judges.split(',').map(formatJudgeName).filter(Boolean);
+      return `<div class="bench-group">${session}<ul class="judge-list">${judges.map((j) => `<li>${esc(j)}</li>`).join('')}</ul></div>`;
+    }).join('')}
+  </div>`;
+}
+
+const courtTiles = new Map(); // courtId → element
+
+function courtIds() {
+  const ids = [...DEFAULT_COURTS];
+  for (const id of Object.keys(state.board?.courts || {})) if (!ids.includes(id)) ids.push(id);
+  return ids;
+}
+
+function renderCourts() {
+  const grid = $('#courts');
+  const courts = state.board?.courts || {};
+  const ids = Object.keys(courts);
+  if (!state.board) return;
+
+  grid.setAttribute('aria-busy', 'false');
+  grid.querySelectorAll('.skeleton').forEach((el) => el.remove());
+  $('#court-count').textContent = ids.length ? `${ids.length} courts` : '';
+
+  if (!ids.length) {
+    grid.innerHTML = '<div class="empty-state"><p class="empty-title">No court data right now</p><p>The board may be empty outside court hours.</p></div>';
+    courtTiles.clear();
+    return;
+  }
+  grid.querySelector('.empty-state')?.remove();
+
+  for (const id of ids) {
+    const row = courts[id];
+    let tile = courtTiles.get(id);
+    if (!tile) {
+      tile = document.createElement('article');
+      tile.className = 'court-tile';
+      tile.dataset.court = id;
+      tile.innerHTML = `
+        <div class="tile-head"><h3>${esc(courtLabel(id))}</h3><span class="chip"></span></div>
+        <div class="tile-body"></div>
+        <details class="more"><summary>More details</summary><div class="more-body"></div></details>
+        <button type="button" class="link-btn track-here" data-track="${esc(id)}">+ Track a case here</button>`;
+      courtTiles.set(id, tile);
+      grid.appendChild(tile);
+    }
+
+    const chip = chipFor(row);
+    const chipEl = tile.querySelector('.chip');
+    chipEl.className = `chip chip-${chip.cls}`;
+    chipEl.textContent = chip.text;
+
+    const mine = state.cases.filter((c) => c.court === id);
+    tile.classList.toggle('has-mine', mine.length > 0);
+    const next = nextItems(row, 5);
+    const mineHTML = mine.length ? `<ul class="mine">${mine.map((c) => {
+      const s = statusFor(c);
+      const short = s.state === 'now' ? 'on now' : (s.state === 'near' || s.state === 'close' || s.state === 'waiting') ? `${s.ahead} before yours` : STATUS_COPY[s.state](s).title.toLowerCase();
+      return `<li data-state="${s.state}">Your item ${c.item}: ${esc(short)}</li>`;
+    }).join('')}</ul>` : '';
+
+    patch(tile.querySelector('.tile-body'), `
+      <div class="tile-now">
+        <span class="num-label">Now hearing</span>
+        <span class="big">${row.current ?? '–'}</span>
+      </div>
+      <p class="tile-next"><span class="num-label">Next</span> ${next.length ? next.join(', ') : '–'}</p>
+      ${mineHTML}
+      ${benchHTML(id)}`);
+
+    patch(tile.querySelector('.more-body'), `
+      ${row.registration ? `<p><span class="more-label">Case</span> ${esc(row.registration)}</p>` : ''}
+      ${row.petitioner || row.respondent ? `<p><span class="more-label">Parties</span> ${esc(row.petitioner || '–')} <em>vs</em> ${esc(row.respondent || '–')}</p>` : ''}
+      ${row.name ? `<p><span class="more-label">Board name</span> ${esc(row.name)}</p>` : ''}
+      <p class="more-label">Announced order</p>
+      <p class="seq-text">${esc(row.sequenceText || 'Not announced')}</p>`);
+  }
+  for (const [id, tile] of courtTiles) {
+    if (!(id in courts)) { tile.remove(); courtTiles.delete(id); }
+  }
+}
+
+function applyOnlyMine() {
+  const hasCases = state.cases.length > 0;
+  const box = $('#only-mine');
+  box.disabled = !hasCases;
+  box.checked = state.onlyMine && hasCases;
+  $('#only-mine-label').classList.toggle('disabled', !hasCases);
+  $('#courts').classList.toggle('only-mine', box.checked);
+}
+
+function renderCourtOptions() {
+  const select = $('#court-select');
+  const current = select.value;
+  const html = '<option value="">Choose a court</option>' +
+    courtIds().map((id) => `<option value="${esc(id)}">${esc(courtLabel(id))}</option>`).join('');
+  if (select.__html !== html) {
+    select.innerHTML = html;
+    select.__html = html;
+    select.value = current;
+  }
+}
+
+function renderAlertAheadOptions() {
+  const select = $('#alert-ahead');
+  select.innerHTML = ALERT_AHEAD_CHOICES.map((n) => `<option value="${n}">${plural(n, 'case')}</option>`).join('');
+  if (!ALERT_AHEAD_CHOICES.includes(state.alertAhead)) {
+    select.insertAdjacentHTML('beforeend', `<option value="${state.alertAhead}">${plural(state.alertAhead, 'case')}</option>`);
+  }
+  select.value = String(state.alertAhead);
+}
+
+function setRow(rowId, ok, warn = false) {
+  const row = $(rowId);
+  row.dataset.ok = ok ? 'yes' : warn ? 'warn' : 'no';
+}
+
+function renderSetup() {
+  // Notifications
+  const btn = $('#notif-btn');
+  const desc = $('#notif-desc');
+  if (!notifSupported()) {
+    setRow('#row-notif', false, true);
+    btn.hidden = true;
+    desc.textContent = isIOS()
+      ? 'On iPhone/iPad: tap Share, then “Add to Home Screen”, and open the app from there to get notifications.'
+      : 'Not available in this browser. You will still get sound and on-screen alerts.';
+  } else if (Notification.permission === 'granted') {
+    setRow('#row-notif', true);
+    btn.hidden = true;
+    desc.textContent = 'On. You will get a pop-up even while using other tabs.';
+  } else if (Notification.permission === 'denied') {
+    setRow('#row-notif', false, true);
+    btn.hidden = true;
+    desc.textContent = 'Blocked. To fix: click the lock icon next to the web address, set Notifications to “Allow”, then reload this page.';
+  } else {
+    setRow('#row-notif', false);
+    btn.hidden = false;
+    desc.textContent = 'Off. Turn on to get pop-up messages, even while using other tabs.';
+  }
+
+  // Sound
+  const soundSwitch = $('#sound-switch');
+  soundSwitch.setAttribute('aria-checked', String(state.soundOn));
+  const soundDesc = $('#sound-desc');
+  if (!state.soundOn) {
+    setRow('#row-sound', false);
+    soundDesc.textContent = 'Off. Good for a quiet courtroom; you will still get notifications and vibration.';
+  } else if (!audioReady()) {
+    setRow('#row-sound', false, true);
+    soundDesc.textContent = 'Tap anywhere on this page once so your browser allows sound.';
+  } else {
+    setRow('#row-sound', true);
+    soundDesc.textContent = 'On. Beeps get louder as your case gets closer.';
+  }
+
+  // Keep screen on
+  const wakeSwitch = $('#wake-switch');
+  const wakeDesc = $('#wake-desc');
+  if (!wakeSupported()) {
+    setRow('#row-wake', false, true);
+    wakeSwitch.disabled = true;
+    wakeSwitch.setAttribute('aria-checked', 'false');
+    wakeDesc.textContent = 'Not available in this browser. Keep your screen awake yourself if your phone sleeps.';
+  } else {
+    wakeSwitch.setAttribute('aria-checked', String(state.wakeWanted));
+    setRow('#row-wake', !!wakeLock, state.wakeWanted && !wakeLock);
+    wakeDesc.textContent = wakeLock
+      ? 'On. Your screen will stay awake while this page is open.'
+      : !state.wakeWanted
+        ? 'Off. Turn on so your phone does not sleep while you wait.'
+        : wakeRefused
+          ? 'Your browser did not allow this (battery saver can block it). Keep your screen awake yourself.'
+          : 'Will turn on when this page is on screen.';
+  }
+}
+
+function renderStatus() {
+  const strip = $('#status-strip');
+  const text = $('#status-text');
+  const time = state.lastOk?.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  if (state.error === 'offline') {
+    strip.dataset.state = 'error';
+    text.textContent = `No internet connection. Retrying…${time ? ` Last update ${time}.` : ''}`;
+  } else if (state.error === 'auth') {
+    strip.dataset.state = 'error';
+    text.textContent = 'Sign-in needed. Please reload the page.';
+  } else if (state.error === 'server') {
+    strip.dataset.state = 'error';
+    text.textContent = `Court board is not responding. Retrying…${time ? ` Last update ${time}.` : ''}`;
+  } else if (state.lastOk) {
+    strip.dataset.state = 'live';
+    text.textContent = `Live · checked at ${time}`;
+  } else {
+    strip.dataset.state = 'connecting';
+    text.textContent = 'Connecting to the court board…';
+  }
+}
+
+function renderLog() {
+  const card = $('#log-card');
+  card.hidden = state.log.length === 0;
+  patch($('#notif-log'), state.log.map((l) =>
+    `<li data-level="${esc(l.level)}"><span class="log-text"><strong>${esc(l.title)}</strong> ${esc(l.body)}</span><time>${esc(l.time)}</time></li>`
+  ).join(''));
+}
+
+function renderAll() {
+  renderCases();
+  renderHotBanner();
+  renderCourts();
+  applyOnlyMine();
+  renderSetup();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Data
+// ═══════════════════════════════════════════════════════════════
+
+let pollTimer = null;
+let polling = false;
+
+async function poll() {
+  if (polling) return;
+  polling = true;
+  clearTimeout(pollTimer);
+  try {
+    const res = await fetch('/api/board', { cache: 'no-store' });
+    if (res.status === 401) { state.error = 'auth'; return; }
+    if (!res.ok) throw new Error(`board ${res.status}`);
+    state.board = await res.json();
+    state.lastOk = new Date();
+    state.error = null;
+    renderCourtOptions();
+    renderAll();
+    for (const a of dueAlerts(state.cases, state.board, state.alertAhead, state.fired, new Date().toDateString())) {
+      fireAlert(a);
+    }
+  } catch (e) {
+    console.warn('Board check failed:', e.message);
+    state.error = navigator.onLine === false ? 'offline' : 'server';
+  } finally {
+    polling = false;
+    renderStatus();
+    // Keeps running while the tab is in the background (browsers may slow it down)
+    pollTimer = setTimeout(poll, POLL_MS);
+  }
+}
+
 async function fetchCoram() {
   try {
     const res = await fetch('/api/coram', { cache: 'no-store' });
     if (!res.ok) return;
-    coramData = await res.json();
-    // Re-render courts with coram data if board is ready
-    if (lastBoard) {
-      const matters = parseMatters(mattersEl.value);
-      const threshold = Math.max(1, Number(thresholdEl.value) || 5);
-      renderCourts(lastBoard);
-    }
+    state.coram = await res.json();
+    renderCourts();
   } catch (e) {
-    console.error('Coram fetch error:', e);
+    console.error('Bench info unavailable:', e);
   }
 }
 
-// ── Fetch ──
-async function fetchBoard() {
-  const res = await fetch('/api/board', { cache: 'no-store' });
-  if (!res.ok) throw new Error('board fetch failed');
-  return res.json();
+// ═══════════════════════════════════════════════════════════════
+// Actions
+// ═══════════════════════════════════════════════════════════════
+
+function showFormError(message, field) {
+  const el = $('#add-error');
+  el.textContent = message;
+  el.hidden = !message;
+  for (const f of ['#court-select', '#item-input']) $(f).removeAttribute('aria-invalid');
+  if (field) { $(field).setAttribute('aria-invalid', 'true'); $(field).focus(); }
 }
 
-// ── Render: Coram helper ──
-function renderCoram(courtId) {
-  if (!coramData?.courts?.[courtId]) return '';
-  const c = coramData.courts[courtId];
-  if (!c.primaryJudges) return '';
+function addCase(e) {
+  e.preventDefault();
+  unlockAudio();
+  const courtSelect = $('#court-select');
+  const itemInput = $('#item-input');
+  let court = courtSelect.value;
+  let itemText = itemInput.value.trim();
 
-  // Clean up judge names: "HON'BLE MR. JUSTICE J.K. MAHESHWARI" → "Justice J.K. Maheshwari"
-  const raw = c.primaryJudges;
-  const judgeNames = raw.split(',').map(name => {
-    return name.trim()
-      .replace(/HON['']?BLE\s*/gi, '')
-      .replace(/MR\.\s*JUSTICE\s*/gi, 'Justice ')
-      .replace(/MS\.\s*JUSTICE\s*/gi, 'Justice ')
-      .replace(/MRS\.\s*JUSTICE\s*/gi, 'Justice ')
-      .replace(/DR\.\s*JUSTICE\s*/gi, 'Justice (Dr.) ')
-      .replace(/THE\s+CHIEF\s+JUSTICE/gi, 'Chief Justice of India')
-      .replace(/\s+/g, ' ')
-      .trim();
-  }).filter(Boolean);
-
-const session = c.primarySession && c.primarySession.toLowerCase() !== 'whole day'
-    ? `<span class="session-tag">${esc(c.primarySession)}</span>`
-    : '';
-
-  const judgeListHTML = judgeNames.map(j =>
-    `<div class="judge-name-item"><span class="judge-dot"></span>${esc(j)}</div>`
-  ).join('');
-
-  return `
-    <div class="coram">
-      <div class="bench-header">
-        <span class="bench-label">Bench</span>
-        ${session}
-      </div>
-      <div class="judge-list">${judgeListHTML}</div>
-    </div>`;
-}
-
-// ── Render: Courts ──
-function renderCourts(data) {
-  const entries = Object.entries(data.courts);
-  const countEl = document.getElementById('court-count');
-  if (countEl) countEl.textContent = entries.length ? `${entries.length} courts` : '';
-
-  if (!entries.length) {
-    courtsEl.innerHTML = '<div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="32" height="32"><path stroke-linecap="round" stroke-linejoin="round" d="M12 21v-8.25M15.75 21v-8.25M8.25 21v-8.25M3 9l9-6 9 6m-1.5 12V10.332A48.36 48.36 0 0012 9.75c-2.551 0-5.056.2-7.5.582V21"/></svg></div>No court data available yet.</div>';
-    return;
+  // Forgiving input: "3/12" typed into the item box
+  const combined = itemText.match(/^(\S+)\s*\/\s*(\S+)$/);
+  if (combined && normalizeCourt(combined[1])) {
+    court = normalizeCourt(combined[1]);
+    itemText = combined[2];
   }
 
-  courtsEl.innerHTML = '';
-  entries.forEach(([id, row]) => {
-    const seq = row.sequence || [];
-    const idx = seq.indexOf(row.current);
-    const nextFew = idx >= 0 ? seq.slice(idx + 1, idx + 6) : [];
-    const progress = (seq.length && idx >= 0) ? Math.round(((idx + 1) / seq.length) * 100) : 0;
+  if (!court) return showFormError('Please choose a court.', '#court-select');
+  if (!courtIds().includes(court)) {
+    return showFormError(`There is no ${courtLabel(court)} on the board. Please choose a court from the list.`, '#court-select');
+  }
+  const item = parseItem(itemText);
+  if (!item) return showFormError('Please type the item number as a whole number, like 12.', '#item-input');
+  if (state.cases.some((c) => c.court === court && c.item === item)) {
+    return showFormError(`You are already tracking ${courtLabel(court)}, item ${item}.`, '#item-input');
+  }
 
-    const div = document.createElement('div');
+  showFormError('');
+  state.cases.push({ court, item });
+  saveCases();
+  itemInput.value = '';
+  renderCourtOptions();
+  courtSelect.value = court; // keep the court, ready for the next item
+  renderAll();
+  toast(`Tracking ${courtLabel(court)}, item ${item}`, { type: 'success' });
+  checkNow();
+  askNotificationPermission(); // asked right after the user's click, when browsers allow it
+}
 
-    let statusClass = 'idle';
-    if (row.status && row.status.toUpperCase().includes('HEARING')) statusClass = 'hearing';
-    else if (row.status && row.status.toUpperCase().includes('MENTION')) statusClass = 'mentioning';
-    div.className = `tile ${statusClass}`;
-
-    div.innerHTML = `
-      <div class="head">
-        <span class="court-label">Court ${esc(id)}</span>
-        <span class="judge-name">${esc(row.name || '')}</span>
-      </div>
-      <div class="current-item">${row.current ?? '—'}</div>
-      <div class="meta">Status: <strong>${esc(row.status || '—')}</strong></div>
-      <div class="meta">Next: ${nextFew.length ? nextFew.join(', ') : '—'}</div>
-      ${seq.length ? `<div class="progress-bar"><div class="fill" style="width:${progress}%"></div></div>` : ''}
-${renderCoram(id)}
-      <details>
-        <summary>Full details</summary>
-        <div>${esc(row.registration || '—')}</div>
-        <div>${esc(row.petitioner || '—')} vs ${esc(row.respondent || '—')}</div>
-        <div style="white-space:pre-wrap;margin-top:4px">${esc(row.sequenceText || '—')}</div>
-      </details>
-    `;
-    courtsEl.appendChild(div);
+function removeCase(key) {
+  const idx = state.cases.findIndex((c) => caseKey(c) === key);
+  if (idx < 0) return;
+  const [removed] = state.cases.splice(idx, 1);
+  saveCases();
+  renderAll();
+  toast(`Removed ${courtLabel(removed.court)}, item ${removed.item}`, {
+    duration: 6000,
+    action: {
+      label: 'Undo',
+      onClick: () => {
+        state.cases.splice(Math.min(idx, state.cases.length), 0, removed);
+        saveCases();
+        renderAll();
+      },
+    },
   });
 }
 
-// ── Render: Alerts ──
-function renderAlerts(matters, data, threshold) {
-  if (!matters.length) {
-    alertsEl.innerHTML = '<div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="32" height="32"><path stroke-linecap="round" stroke-linejoin="round" d="M14.857 17.082a23.848 23.848 0 005.454-1.31A8.967 8.967 0 0118 9.75v-.7V9A6 6 0 006 9v.75a8.967 8.967 0 01-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 01-5.714 0m5.714 0a3 3 0 11-5.714 0"/></svg></div>Enter matters above (e.g. <code>1/12</code>) and Save to start tracking.</div>';
-    return;
+// Fire alerts for newly added/changed cases straight away
+function checkNow() {
+  if (!state.board) return;
+  for (const a of dueAlerts(state.cases, state.board, state.alertAhead, state.fired, new Date().toDateString())) {
+    fireAlert(a);
   }
+}
 
-  alertsEl.innerHTML = '';
-  matters.forEach(m => {
-    const row = data.courts[m.court];
-    const current = row ? row.current : null;
-    const seq = row ? row.sequence : [];
-    const windowList = preAlertWindow(seq, m.item, threshold);
+function trackHere(courtId) {
+  renderCourtOptions();
+  $('#court-select').value = courtId;
+  showFormError('');
+  $('#my-cases').scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
+  $('#item-input').focus({ preventScroll: true });
+}
 
-    let status = 'Waiting for session';
-    let distance = null;
-    let urgency = 'waiting'; // waiting | far | close | now | passed
+async function runTest() {
+  unlockAudio();
+  await askNotificationPermission();
+  const c = state.cases[0] || { court: '3', item: 12 };
+  const steps = [
+    { state: 'near', ahead: 3 },
+    { state: 'close', ahead: 1 },
+    { state: 'now', ahead: 0 },
+  ];
+  toast('Playing 3 test alerts over 4 seconds…');
+  steps.forEach((s, i) => setTimeout(() => fireAlert({ ...c, ...s, current: Math.max(1, c.item - s.ahead) }, { test: true }), 600 + i * 1800));
+}
 
-    if (current != null) {
-      const idxInWindow = windowList.indexOf(current);
-      if (idxInWindow >= 0) {
-        distance = windowList.length - idxInWindow - 1;
+function setTheme(dark) {
+  document.documentElement.classList.toggle('dark', dark);
+  const btn = $('#theme-toggle');
+  btn.setAttribute('aria-pressed', String(dark));
+  $('#theme-label').textContent = dark ? 'Light mode' : 'Dark mode';
+  btn.title = dark ? 'Switch to light mode' : 'Switch to dark mode';
+}
 
-        if (distance === 0) {
-          status = 'NOW — Your item is being heard';
-          urgency = 'now';
-        } else if (distance <= 2) {
-          status = `${distance} away — Get ready!`;
-          urgency = 'close';
-        } else {
-          status = `${distance} away`;
-          urgency = 'far';
-        }
+function setGuide(show) {
+  $('#guide').hidden = !show;
+  if (!show) store.set('guideDone', '1');
+}
 
-        // fire notification
-        const key = `${m.court}-${current}`;
-        if (!fired.has(key)) {
-          fired.add(key);
-          const detail = row?.registration ? ` · ${row.registration}` : '';
-          const nTitle = urgency === 'now'
-            ? `🔴 Court ${m.court}: YOUR ITEM ${m.item}`
-            : `Court ${m.court}: Item ${current}`;
-          const nBody = urgency === 'now'
-            ? `Item ${m.item} is being heard NOW${detail}`
-            : `${distance} away from item ${m.item}${detail}`;
-          notify(nTitle, nBody, urgency);
-        }
-      } else {
-        const idxTarget = seq.indexOf(m.item);
-        const idxCurrent = seq.indexOf(current);
-        if (idxTarget >= 0 && idxCurrent >= 0) {
-          distance = idxTarget - idxCurrent;
-          if (distance < 0) {
-            status = 'Passed';
-            urgency = 'passed';
-          } else if (distance === 0) {
-            status = 'NOW — Your item is being heard';
-            urgency = 'now';
-          } else if (distance <= 2) {
-            status = `${distance} away — Get ready!`;
-            urgency = 'close';
-          } else {
-            status = `${distance} away`;
-            urgency = 'far';
-          }
-        } else if (idxTarget < 0) {
-          status = 'Not in declared sequence';
-        } else {
-          status = 'In session';
-        }
-      }
-    }
+// ═══════════════════════════════════════════════════════════════
+// Wire up
+// ═══════════════════════════════════════════════════════════════
 
-    const distLabel = distance != null && distance >= 0
-      ? `<div class="alert-distance ${urgency === 'now' ? 'now' : urgency === 'close' ? 'close' : 'far'}">${distance === 0 ? 'NOW' : distance}</div>`
-      : '';
+function init() {
+  setTheme(document.documentElement.classList.contains('dark'));
+  $('#storage-note').hidden = store.persistent;
+  setGuide(store.get('guideDone') !== '1');
+  renderCourtOptions();
+  renderAlertAheadOptions();
+  renderAll();
+  renderStatus();
 
-    const div = document.createElement('div');
-    div.className = `tile alert-${urgency}`;
-    div.innerHTML = `
-      <div class="head">
-        <span class="alert-matter">C${esc(m.court)}/${m.item}</span>
-        ${distLabel}
-      </div>
-      <div class="meta">${esc(status)}</div>
-      <div class="meta">Current item: <strong>${current ?? '—'}</strong></div>
-    `;
-    alertsEl.appendChild(div);
+  $('#add-form').addEventListener('submit', addCase);
+  $('#court-select').addEventListener('change', () => showFormError(''));
+  $('#item-input').addEventListener('input', () => { if (!$('#add-error').hidden) showFormError(''); });
+
+  $('#case-list').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-remove]');
+    if (btn) removeCase(btn.dataset.remove);
   });
-}
-
-// ── Ticker (update without resetting CSS animation) ──
-let lastTickerText = '';
-function updateTicker(text) {
-  if (text === lastTickerText) return;
-  lastTickerText = text;
-  const tickerEl = document.getElementById('ticker');
-  if (tickerEl) tickerEl.textContent = text || '—';
-}
-
-// ── Main loop ──
-async function loop() {
-  try {
-    const data = await fetchBoard();
-    lastBoard = data;
-
-    updatedEl.textContent = data.updatedAt || new Date().toLocaleString();
-    updatedEl.style.color = '';
-    pulseEl.classList.remove('error');
-    statusTextEl.textContent = 'Live';
-
-    updateTicker(data.tickerText || '—');
-
-    const matters = parseMatters(mattersEl.value);
-    const threshold = Math.max(1, Number(thresholdEl.value) || 5);
-    renderCourts(data);
-    renderAlerts(matters, data, threshold);
-  } catch (e) {
-    console.error(e);
-    updatedEl.textContent = 'Connection error — retrying…';
-    updatedEl.style.color = '#dc2626';
-    pulseEl.classList.add('error');
-    statusTextEl.textContent = 'Disconnected';
-  } finally {
-    pollTimer = setTimeout(loop, 10000);
-  }
-}
-
-// ── Visibility: pause in background, resume on focus ──
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) {
-    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
-  } else {
-    if (!pollTimer) loop();
-  }
-});
-
-// ── UI Events ──
-function doSave() {
-  ensureAudio();
-  setStored({ matters: mattersEl.value, threshold: thresholdEl.value });
-  fired.clear();
-
-// Visual feedback on button
-  const saveSvg = saveBtn.querySelector('svg');
-  saveBtn.textContent = '✓ Saved';
-  saveBtn.classList.add('saved');
-  setTimeout(() => {
-    saveBtn.textContent = '';
-    if (saveSvg) saveBtn.appendChild(saveSvg);
-    saveBtn.appendChild(document.createTextNode(' Save'));
-    saveBtn.classList.remove('saved');
-  }, 1200);
-
-  toast('Matters saved', 'success');
-
-  // Re-render alerts immediately with current data
-  if (lastBoard) {
-    const matters = parseMatters(mattersEl.value);
-    const threshold = Math.max(1, Number(thresholdEl.value) || 5);
-    renderAlerts(matters, lastBoard, threshold);
-  }
-}
-
-saveBtn.addEventListener('click', doSave);
-
-// Auto-save when user leaves textarea or threshold
-mattersEl.addEventListener('blur', () => {
-  const stored = getStored();
-  if (mattersEl.value !== stored.matters) doSave();
-});
-thresholdEl.addEventListener('change', doSave);
-
-clearBtn.addEventListener('click', () => {
-  mattersEl.value = '';
-  setStored({ matters: '', threshold: thresholdEl.value });
-  alertsEl.innerHTML = '<div class="empty-state"><div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="32" height="32"><path stroke-linecap="round" stroke-linejoin="round" d="M14.857 17.082a23.848 23.848 0 005.454-1.31A8.967 8.967 0 0118 9.75v-.7V9A6 6 0 006 9v.75a8.967 8.967 0 01-2.312 6.022c1.733.64 3.56 1.085 5.455 1.31m5.714 0a24.255 24.255 0 01-5.714 0m5.714 0a3 3 0 11-5.714 0"/></svg></div>Enter matters above (e.g. <code>1/12</code>) and Save to start tracking.</div>';
-  toast('Cleared');
-});
-
-testBtn.addEventListener('click', async () => {
-  ensureAudio();
-  const ok = await ensurePermission();
-  updateBanner();
-  if (!ok) {
-    toast('Please allow notifications first.', 'error');
-    return;
-  }
-
-  try {
-    if (!lastBoard) lastBoard = await fetchBoard();
-    const matters = parseMatters(mattersEl.value);
-
-    if (!matters.length) {
-      toast('Enter at least one matter first (e.g. 1/12)', 'error');
-      return;
-    }
-    const threshold = Math.max(1, Number(thresholdEl.value) || 5);
-
-    let delay = 0;
-
-    matters.forEach(m => {
-      const row = lastBoard.courts[m.court];
-      const seq = row ? row.sequence : [];
-      const windowList = preAlertWindow(seq, m.item, threshold);
-      const detail = row?.registration ? ` · ${row.registration}` : '';
-
-      windowList.forEach((num, idx) => {
-        const dist = windowList.length - idx - 1;
-        const u = dist === 0 ? 'now' : dist <= 2 ? 'close' : 'far';
-        setTimeout(() => {
-          const title = dist === 0
-            ? `TEST 🔴 Court ${m.court}: YOUR ITEM ${m.item}`
-            : `TEST • Court ${m.court}: Item ${num}`;
-          const body = dist === 0
-            ? `Item ${m.item} is being heard NOW${detail}`
-            : `${dist} away from item ${m.item}${detail}`;
-          notify(title, body, u);
-        }, delay + idx * 1200);
-      });
-      delay += windowList.length * 1200 + 600;
-    });
-
-    toast('Test notifications firing…');
-  } catch (e) {
-    console.error(e);
-    toast('Test failed. Try again.', 'error');
-  }
-});
-
-// ── Init ──
-(function init() {
-  const { matters, threshold } = getStored();
-  mattersEl.value = matters;
-  thresholdEl.value = threshold;
-
-  document.addEventListener('click', ensureAudio, { once: true });
-
-updateBanner();
-
-  // ── Theme toggle ──
-  const themeBtn = document.getElementById('theme-toggle');
-
-
-function applyTheme(dark) {
-    document.documentElement.classList.toggle('dark', dark);
-  }
-
-  // Load saved preference, default to light
-  const savedTheme = localStorage.getItem('theme');
-  applyTheme(savedTheme === 'dark');
-
-  themeBtn.addEventListener('click', () => {
-    const isDark = document.documentElement.classList.toggle('dark');
-    localStorage.setItem('theme', isDark ? 'dark' : 'light');
+  $('#courts').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-track]');
+    if (btn) trackHere(btn.dataset.track);
   });
 
-  
-  // Fetch coram on load, then every 5 minutes
+  $('#alert-ahead').addEventListener('change', (e) => {
+    state.alertAhead = clampAlertAhead(e.target.value);
+    store.set('alertAhead', state.alertAhead);
+    renderAll();
+    checkNow();
+    toast(`Alerts will start ${plural(state.alertAhead, 'case')} before yours`);
+  });
+
+  $('#only-mine').addEventListener('change', (e) => {
+    state.onlyMine = e.target.checked;
+    store.set('onlyMine', state.onlyMine ? '1' : '0');
+    applyOnlyMine();
+  });
+
+  $('#notif-btn').addEventListener('click', async () => {
+    unlockAudio();
+    await askNotificationPermission();
+    if (Notification.permission === 'granted') toast('Notifications are on', { type: 'success' });
+    else if (Notification.permission === 'denied') toast('Notifications are blocked. See the steps in the Alerts box.', { type: 'error', duration: 5000 });
+  });
+
+  $('#sound-switch').addEventListener('click', () => {
+    state.soundOn = !state.soundOn;
+    store.set('soundOn', state.soundOn ? '1' : '0');
+    unlockAudio();
+    if (state.soundOn) setTimeout(() => beep('near'), 50); // let them hear it
+    renderSetup();
+  });
+
+  $('#wake-switch').addEventListener('click', () => {
+    state.wakeWanted = !state.wakeWanted;
+    store.set('keepScreenOn', state.wakeWanted ? '1' : '0');
+    applyWakeLock();
+  });
+
+  $('#test-btn').addEventListener('click', runTest);
+  $('#theme-toggle').addEventListener('click', () => {
+    const dark = !document.documentElement.classList.contains('dark');
+    store.set('theme', dark ? 'dark' : 'light');
+    setTheme(dark);
+  });
+  $('#guide-close').addEventListener('click', () => { setGuide(false); $('#court-select').focus(); });
+  $('#guide-open').addEventListener('click', () => { setGuide(true); $('#guide').scrollIntoView({ block: 'start' }); });
+
+  // Browsers only allow sound after the first tap/click/key press
+  for (const evt of ['pointerdown', 'keydown']) document.addEventListener(evt, unlockAudio, { once: true, capture: true });
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      poll(); // refresh straight away when you come back
+      applyWakeLock(); // the browser drops the screen lock when hidden
+    }
+  });
+  window.addEventListener('online', poll);
+
+  applyWakeLock();
   fetchCoram();
-  coramTimer = setInterval(fetchCoram, 5 * 60 * 1000);
+  setInterval(fetchCoram, CORAM_MS);
+  poll();
+}
 
-  loop();
-})();
+init();

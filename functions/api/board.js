@@ -1,12 +1,25 @@
 // functions/api/board.js
-// Cloudflare Pages Function — replaces the Express /api/board endpoint
+// Live Supreme Court display board, normalized for the app.
+// Password protection (if configured) is handled in functions/_middleware.js.
 
 const DEFAULT_COURTS = '1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,21,22';
 const DEFAULT_CACHE_TTL = 8; // seconds
+const MAX_RANGE = 500; // bounds "N onwards" / "N to M" so one typo can't build a huge list
 
-// ── helpers (identical to server.js) ──────────────────────────────
+// ── helpers ───────────────────────────────────────────────────────
 
-const stripHtml = (raw = '') => raw.replace(/<[^>]*>/g, '').trim();
+// Upstream text may carry HTML; keep its line breaks and decode common entities.
+const stripHtml = (raw = '') =>
+  String(raw)
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<[^>]*>/g, '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#0?39;|&apos;/gi, "'")
+    .replace(/&amp;/gi, '&')
+    .trim();
 
 const parseCurrentItem = (val) => {
   if (val == null) return null;
@@ -14,10 +27,12 @@ const parseCurrentItem = (val) => {
   return Number.isFinite(n) ? n : null;
 };
 
-function parseSequence(message = '') {
-  const upper = message
+export function parseSequence(message = '') {
+  const upper = stripHtml(message)
     .toUpperCase()
     .replace(/COURT WILL SIT AT[^\n]*/g, ' ')
+    // "1-5" / "1 – 5" → "1 TO 5"; a longer chain like a date (23-03-2026) is left alone
+    .replace(/(?<![\d-])(\d+)\s*[-–—]\s*(\d+)(?![\d-])/g, '$1 TO $2')
     .replace(
       /SEQUENCE|WOULD BE|ITEM NOS?\.?|ITEMS?\.?|PASS ?OVER IF ANY|THEREAFTER|THEN|AND|FRESH ?PASSOVER|FRESH/g,
       ' '
@@ -38,15 +53,14 @@ function parseSequence(message = '') {
 
     if (isNum(a) && b === 'ONWARDS') {
       const start = +a;
-      const cap = start + 500; // reasonable cap; avoids massive arrays
-      for (let v = start; v <= cap; v++) out.push(v);
+      for (let v = start; v <= start + MAX_RANGE; v++) out.push(v);
       i += 1;
       continue;
     }
     if (isNum(a) && b === 'TO' && isNum(c)) {
       const start = +a,
-        end = +c,
-        step = start <= end ? 1 : -1;
+        step = start <= +c ? 1 : -1,
+        end = Math.abs(+c - start) > MAX_RANGE ? start + step * MAX_RANGE : +c;
       for (let v = start; v !== end + step; v += step) out.push(v);
       i += 2;
     } else if (isNum(a)) {
@@ -58,19 +72,7 @@ function parseSequence(message = '') {
   return out.filter((n) => (seen.has(n) ? false : (seen.add(n), true)));
 }
 
-function buildTicker(upstream, courtsMap) {
-  const ts = upstream?.now_2 || upstream?.now || '';
-  const parts = [`Sequence — ${ts}`];
-  for (const id of Object.keys(courtsMap)) {
-    const row = courtsMap[id];
-    if (!row) continue;
-    const msg = (row.sequenceText || row.status || '').trim();
-    if (msg) parts.push(`Court C${id}: ${msg}`);
-  }
-  return parts.join('  |  ');
-}
-
-function normalize(upstream) {
+export function normalize(upstream) {
   const courts = {};
   const list = upstream?.listedItemDetails || [];
   for (const row of list) {
@@ -90,36 +92,10 @@ function normalize(upstream) {
       respondent: stripHtml(row.respondent_name || ''),
     };
   }
-  const tickerText = buildTicker(upstream, courts);
   return {
     updatedAt: upstream?.now || new Date().toISOString(),
-    tickerText,
     courts,
   };
-}
-
-// ── Basic Auth check ──────────────────────────────────────────────
-
-function checkAuth(request, env) {
-  const user = env.AUTH_USER;
-  const pass = env.AUTH_PASS;
-  if (!user || !pass) return true; // no auth configured → open
-
-  const hdr = request.headers.get('Authorization') || '';
-  const [type, token] = hdr.split(' ');
-  if (type === 'Basic' && token) {
-    try {
-      const decoded = atob(token);
-      const idx = decoded.indexOf(':');
-      if (idx < 0) return false;
-      const u = decoded.slice(0, idx);
-      const p = decoded.slice(idx + 1); // handles passwords containing ':'
-      if (u === user && p === pass) return true;
-    } catch {
-      return false; // malformed base64 → reject, don't crash
-    }
-  }
-  return false;
 }
 
 // ── Main handler ──────────────────────────────────────────────────
@@ -136,17 +112,6 @@ export async function onRequest(context) {
 
   if (request.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
-  }
-
-  // Auth gate
-  if (!checkAuth(request, env)) {
-    return new Response('Auth required', {
-      status: 401,
-      headers: {
-        ...corsHeaders,
-        'WWW-Authenticate': 'Basic realm="SC Alerts"',
-      },
-    });
   }
 
   try {
